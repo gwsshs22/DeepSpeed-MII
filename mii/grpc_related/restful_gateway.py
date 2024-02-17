@@ -5,6 +5,9 @@
 import asyncio
 import time
 import threading
+import sys
+import os
+import signal
 
 from flask import Flask, request, jsonify
 from flask_restful import Resource, Api
@@ -13,11 +16,21 @@ from werkzeug.serving import make_server
 import mii
 from mii.constants import RESTFUL_GATEWAY_SHUTDOWN_TIMEOUT, RESTFUL_API_PATH
 
+GATEWAY_THREAD = None
 
-def shutdown(thread):
-    time.sleep(RESTFUL_GATEWAY_SHUTDOWN_TIMEOUT)
-    thread.server.shutdown()
+def init_gateway(deployment_name, rest_host, rest_port, rest_procs):
+    global GATEWAY_THREAD
+    if GATEWAY_THREAD is None:
+        GATEWAY_THREAD = RestfulGatewayThread(deployment_name, rest_host, rest_port, rest_procs)
+    return GATEWAY_THREAD
 
+# Signal handler function
+def signal_handler(signum, frame):
+    global GATEWAY_THREAD
+    GATEWAY_THREAD.server.shutdown()
+
+# Set up signal handling
+signal.signal(signal.SIGUSR1, signal_handler)
 
 def createRestfulGatewayApp(deployment_name, server_thread):
     class RestfulGatewayService(Resource):
@@ -36,8 +49,8 @@ def createRestfulGatewayApp(deployment_name, server_thread):
 
     @app.route("/terminate", methods=["GET"])
     def terminate():
-        # Need to shutdown *after* completing the request
-        threading.Thread(target=shutdown, args=(server_thread, )).start()
+        # Send parent process a signal
+        os.kill(os.getppid(), signal.SIGUSR1)
         return "Shutting down RESTful API gateway server"
 
     api = Api(app)
@@ -50,6 +63,7 @@ def createRestfulGatewayApp(deployment_name, server_thread):
 class RestfulGatewayThread(threading.Thread):
     def __init__(self, deployment_name, rest_host, rest_port, rest_procs):
         threading.Thread.__init__(self)
+        self.deployment_name = deployment_name
 
         app = createRestfulGatewayApp(deployment_name, self)
         self.server = make_server(rest_host,
@@ -60,11 +74,12 @@ class RestfulGatewayThread(threading.Thread):
         self.ctx = app.app_context()
         self.ctx.push()
 
-        self._stop_event = threading.Event()
-
     def run(self):
         self.server.serve_forever()
-        self._stop_event.set()
-
-    def get_stop_event(self):
-        return self._stop_event
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        client = mii.client(self.deployment_name)
+        try:
+            loop.run_until_complete(client.terminate_async())
+        except:
+            pass

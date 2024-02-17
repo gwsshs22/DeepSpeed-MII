@@ -48,6 +48,8 @@ class RaggedBatchBase:
             self.max_length = inference_engine._policy._checkpoint_engine.model_config.max_seq_length
         self.sync_debug = model_config.sync_debug
         self.profile_model_time = model_config.profile_model_time
+        self.run_condition = threading.Condition()
+        self.is_shutdown = False
 
         self.request_queue: queue.Queue = queue.Queue()
         self.result_queues: Dict[int, queue.Queue] = {}
@@ -56,6 +58,8 @@ class RaggedBatchBase:
         self.scheduled_length = 0
         self.scheduled_seq_num = 0
         self.scheduled_req_blocks = 0
+        self.empty_run_scheduled = False
+        self.empty_run_queue = queue.Queue()
 
         # TODO: we will need to prune self._post_processors for long running deployments
         self._post_processors = {}
@@ -70,7 +74,7 @@ class RaggedBatchBase:
 
         self._zmq_context = zmq.Context()
         torch.cuda.synchronize()
-        if self.is_rank_0:
+        if self.is_first_rank_in_replica:
             self.socket = self._zmq_context.socket(zmq.PUB)
             self.socket.bind(f"tcp://*:{self.zmq_port}")
             time.sleep(1)  # Give the subscriber a change to connect
@@ -85,18 +89,58 @@ class RaggedBatchBase:
         return get_accelerator().current_device()
 
     @property
-    def is_rank_0(self) -> bool:
-        return self.local_rank == 0
+    def is_first_rank_in_replica(self) -> bool:
+        return self.local_rank % self.model_config.tensor_parallel == 0
+    
+    def should_run(self) -> bool:
+        return len(self.buffer) > 0 or not self.request_queue.empty() or self.empty_run_scheduled or self.is_shutdown
+
+    def wait_for_run(self) -> None:
+        with self.run_condition:
+            self.run_condition.wait_for(self.should_run)
+
+    def _shutdown(self) -> None:
+        with self.run_condition:
+            self.is_shutdown = True
+            self.run_condition.notify_all()
+
+    def empty_run(self) -> None:
+        assert not self.empty_run_scheduled
+        with self.run_condition:
+            self.empty_run_scheduled = True
+            self.run_condition.notify_all()
+        self.empty_run_queue.get()
+    
+    def put_request_and_notify(self, req) -> None:
+        with self.run_condition:
+            self.request_queue.put(req)
+            self.run_condition.notify_all()
 
     @profiler
     def generate(self) -> None:
-        # 1. Get a batch of requests, broadcast to all ranks
-        scheduled_requests = self._bcast_requests()
+        if self.is_first_rank_in_replica:
+            # 1. Schedule requests
+            self._reset_scheduler_bookkeeping()
+            self.wait_for_run()
+            self.schedule_requests()
 
-        # 2. Flush for uids that are finished generating
+        # 2. Get a batch of requests, broadcast to all ranks
+        scheduled_requests, empty_run = self._bcast_requests()
+
+        if self.is_shutdown:
+            return
+
+        if empty_run:
+            self.inference_engine.empty_run()
+            if self.is_first_rank_in_replica:
+                self.empty_run_scheduled = False
+                self.empty_run_queue.put(None)
+            return
+
+        # 3. Flush for uids that are finished generating
         self.flush(scheduled_requests.requests_to_flush.uids)
 
-        # 3. Put new tokens into inference engine
+        # 4. Put new tokens into inference engine
         if scheduled_requests.requests_to_run:
             next_token_logits = self.put(
                 scheduled_requests.requests_to_run.uids,
@@ -104,10 +148,10 @@ class RaggedBatchBase:
             )
 
         # short circuit if not rank 0, only rank 0 does scheduling and postprocessing of logits
-        if not self.is_rank_0:
+        if not self.is_first_rank_in_replica:
             return
 
-        # 4. Launch logit processing and token generation
+        # 5. Launch logit processing and token generation
         running_requests = scheduled_requests.requests_to_run
         running_requests.update_seq_length()
         if running_requests:
@@ -117,9 +161,6 @@ class RaggedBatchBase:
             running_requests.next_tokens = next_tokens
             running_requests.done_tokens = done_tokens
 
-        # 5. Schedule requests while we wait for the forward pass to finish
-        self._reset_scheduler_bookkeeping()
-
         # 6. Accumulate generated tokens, check completion, and generate output
         for r in running_requests.last_in_prompt:
             r.accumulate_generated_token()
@@ -128,11 +169,7 @@ class RaggedBatchBase:
                 self._generate_output(r)
             if not r.stop_generation:
                 r.set_next_as_input()
-                self.request_queue.put(r)
-
-        # 7. Update scheduled requests
-        self.scheduled_requests.prune(running_requests.completed.uids)
-        self.schedule_requests()
+                self.buffer.append(r)
 
         if self.profile_model_time:
             self._print_profiled_times()
@@ -152,9 +189,17 @@ class RaggedBatchBase:
 
     @sync_debug
     def _bcast_requests(self, force=False) -> RequestBatch:
-        if self.is_rank_0:
+        if self.is_first_rank_in_replica:
+            if self.empty_run_scheduled:
+                assert not self.scheduled_requests.requests_to_run
+                self.socket.send_string("ER")
+                return self.scheduled_requests, True
+
             if not self.scheduled_requests and not force:
-                return self.scheduled_requests
+                if self.is_shutdown:
+                    self.socket.send_string("ST")
+                return self.scheduled_requests, False
+
             # Rank 0 gets batch of requests and broadcasts to other ranks
             data_dicts = self.scheduled_requests.to_msg_dicts()
             json_data = ujson.dumps(data_dicts)
@@ -162,12 +207,19 @@ class RaggedBatchBase:
         else:
             try:
                 json_data = self.socket.recv_string()
+                if json_data == "ER":
+                    self.scheduled_requests = RequestBatch()
+                    return self.scheduled_requests, True
+                elif json_data == "ST":
+                    self._shutdown()
+                    return self.scheduled_requests, False
+
                 data_dicts = ujson.loads(json_data)
                 self.scheduled_requests = RequestBatch.from_msg_dicts(data_dicts)
             except zmq.Again:
                 self.scheduled_requests = RequestBatch()
 
-        return self.scheduled_requests
+        return self.scheduled_requests, False
 
     def _reset_scheduler_bookkeeping(self) -> None:
         self.scheduled_requests = RequestBatch()
@@ -475,7 +527,7 @@ class MIIPipeline(RaggedBatchBase):
 
         self.schedule_requests()
 
-        if self.is_rank_0:
+        if self.is_first_rank_in_replica:
             # Rank 0 runs generate() until all responses are returned
             while uids_running:
                 self.generate()
@@ -509,7 +561,7 @@ class MIIPipeline(RaggedBatchBase):
         self.result_queues[self.tid] = queue.Queue()
         input_tokens = self.tokenizer.encode(input)
         request = self.make_request(self.tid, uid, input_tokens, kwargs)
-        self.request_queue.put(request)
+        self.put_request_and_notify(request)
 
     def _get_response(self) -> Tuple[int, Response]:
         result = self.result_queues[self.tid].get()
@@ -519,7 +571,7 @@ class MIIPipeline(RaggedBatchBase):
         return uid, response
 
     def _bcast_responses(self, responses: List[Response]) -> List[Response]:
-        if self.is_rank_0:
+        if self.is_first_rank_in_replica:
             data_dicts = [r.to_msg_dict() for r in responses]
             json_data = ujson.dumps(data_dicts)
             self.socket.send_string(json_data)
@@ -544,8 +596,6 @@ class MIIAsyncPipeline(RaggedBatchBase):
         self.uids = set()
         self.lock = threading.Lock()
         self.thread = None
-        self.stop_thread = False
-        self._is_shutdown = False
         self.UID_RANGE_LB = 1
         self.UID_RANGE_UB = 10000
 
@@ -555,7 +605,7 @@ class MIIAsyncPipeline(RaggedBatchBase):
         while True:
             self.generate()
 
-            if (self.stop_thread and self.request_queue.empty()
+            if (self.is_shutdown and self.request_queue.empty()
                     and all(q.empty() for q in self.result_queues.values())):
                 break
 
@@ -572,16 +622,16 @@ class MIIAsyncPipeline(RaggedBatchBase):
         # TODO: We should avoid any request/response work with non-rank 0, but
         # this requires some refactoring how we do the put and request in
         # `ModelResponse`
-        #if not self.is_rank_0:
+        #if not self.is_first_rank_in_replica:
         #    return
-        if self.stop_thread:
+        if self.is_shutdown:
             raise RuntimeError("The request queue was shutdown.")
 
         uid = self._get_uid()
 
         # Temporary hack to avoid non-rank 0 processes not shutting down. See
         # related TODO above.
-        if not self.is_rank_0:
+        if not self.is_first_rank_in_replica:
             return uid
 
         tid = threading.get_ident()
@@ -591,7 +641,7 @@ class MIIAsyncPipeline(RaggedBatchBase):
 
         input_tokens = self.tokenizer.encode(prompt)
         request = self.make_request(tid, uid, input_tokens, kwargs)
-        self.request_queue.put(request)
+        self.put_request_and_notify(request)
 
         return uid
 
@@ -599,7 +649,7 @@ class MIIAsyncPipeline(RaggedBatchBase):
         # TODO: We should avoid any request/response work with non-rank 0, but
         # this requires some refactoring how we do the put and request in
         # `ModelResponse`
-        if not self.is_rank_0:
+        if not self.is_first_rank_in_replica:
             return -1, Response(generated_text="",
                             prompt_length=None,
                             generated_length=None,
@@ -620,15 +670,12 @@ class MIIAsyncPipeline(RaggedBatchBase):
         self.thread.start()
 
     def shutdown(self) -> None:
-        self.stop_thread = True
+        # Called by the first rank process.
+        self._shutdown()
         self.thread.join()
-        self._is_shutdown = True
-
-    def is_shutdown(self) -> bool:
-        return self._is_shutdown
 
     def flush_uid(self, uid: int) -> None:
         with self.lock:
-            if self.is_rank_0:
+            if self.is_first_rank_in_replica:
                 self._queue_flush_request(uid)
             self.uids.remove(uid)

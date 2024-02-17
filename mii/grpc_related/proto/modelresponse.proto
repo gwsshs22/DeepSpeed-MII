@@ -25,6 +25,7 @@ package modelresponse;
 
 service ModelResponse {
   rpc Terminate (google.protobuf.Empty) returns (google.protobuf.Empty) {}
+  rpc EmptyRun (google.protobuf.Empty) returns (google.protobuf.Empty) {}
   rpc GeneratorReply (MultiStringRequest) returns (MultiGenerationReply) {}
   rpc GeneratorReplyStream (MultiStringRequest) returns (stream MultiGenerationReply) {}
 }
