@@ -9,7 +9,7 @@ import os
 
 from mii.config import ModelConfig
 from mii.grpc_related.modelresponse_server import serve_inference, serve_load_balancing
-from mii.grpc_related.restful_gateway import RestfulGatewayThread
+from mii.grpc_related.restful_gateway import init_gateway
 from mii.api import async_pipeline
 
 
@@ -39,6 +39,7 @@ def main() -> None:
         help="Port to user for DeepSpeed inference server.",
     )
     parser.add_argument("--zmq-port", type=int, default=0, help="Port to use for ZMQ.")
+    parser.add_argument("--derive-ports", action="store_true", help="Derive server_port and zmq_port for this replica")
     parser.add_argument("--load-balancer",
                         action="store_true",
                         help="Launch load balancer process.")
@@ -75,26 +76,34 @@ def main() -> None:
     if args.restful_gateway:
         assert args.restful_gateway_port, "--restful-gateway-port must be provided."
         print(f"Starting RESTful API gateway on port: {args.restful_gateway_port}")
-        gateway_thread = RestfulGatewayThread(
+        gateway_thread = init_gateway(
             deployment_name=args.deployment_name,
             rest_host=args.restful_gateway_host,
             rest_port=args.restful_gateway_port,
             rest_procs=args.restful_gateway_procs,
         )
-        stop_event = gateway_thread.get_stop_event()
         gateway_thread.start()
-        stop_event.wait()
-
+        gateway_thread.join()
     elif args.load_balancer:
         assert args.load_balancer_port, "--load-balancer-port must be provided."
         print(f"Starting load balancer on port: {args.load_balancer_port}")
         serve_load_balancing(args.model_config, args.load_balancer_port)
 
     else:
-        assert args.server_port, "--server-port must be provided."
+        assert args.server_port or args.derive_ports, "--server-port or --derive_ports must be provided."
         local_rank = int(os.getenv("LOCAL_RANK", "0"))
-        port = args.server_port + local_rank
-        args.model_config.zmq_port_number = args.zmq_port
+
+        if args.derive_ports:
+            rank = int(os.getenv("RANK", "0"))
+            replica_rank = rank // args.model_config.tensor_parallel
+            local_rank_in_replica = local_rank % args.model_config.tensor_parallel
+            port = args.model_config.get_server_port(replica_rank, local_rank_in_replica)
+            zmq_port = args.model_config.get_zmq_port(replica_rank, local_rank_in_replica)
+        else:
+            port = args.server_port + local_rank
+            zmq_port = args.zmq_port
+
+        args.model_config.zmq_port_number = zmq_port
         inference_pipeline = async_pipeline(args.model_config)
         print(f"Starting server on port: {port}")
         serve_inference(inference_pipeline, port)

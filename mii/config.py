@@ -146,6 +146,12 @@ class ModelConfig(DeepSpeedConfigModel):
     Number of model replicas. Enables easy data parallelism.
     """
 
+    expert_parallel: bool = False
+    """
+    Turn on expert parallelism. If expert_parallel = False, the model replicas are
+    depolyed with data + tensor parallelism.
+    """
+
     replica_configs: List[ReplicaConfig] = []
     """
     Configuration details for each replica. This will be automatically
@@ -202,9 +208,19 @@ class ModelConfig(DeepSpeedConfigModel):
         return values
 
     @root_validator
-    def propagate_tp_size(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+    def propagate_tp_ep_config(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         tensor_parallel = values.get("tensor_parallel")
-        values.get("inference_engine_config").tensor_parallel.tp_size = tensor_parallel
+        replica_num = values.get("replica_num")
+        ep_enabled = values.get("expert_parallel")
+
+        if ep_enabled:
+            assert tensor_parallel == 1, "Tensor parallel + expert parallel is currently not supported."
+        
+        inference_engine_config = values.get("inference_engine_config")
+        inference_engine_config.tensor_parallel.tp_size = tensor_parallel
+        inference_engine_config.expert_parallel.enabled = ep_enabled
+        inference_engine_config.expert_parallel.replica_num = replica_num
+
         return values
 
     @root_validator
@@ -214,6 +230,11 @@ class ModelConfig(DeepSpeedConfigModel):
             assert num_replica_config == values.get("replica_num"), "Number of replica configs must match replica_num"
         return values
 
+    def get_server_port(self, replica_rank, local_rank):
+        return self.replica_configs[replica_rank].tensor_parallel_ports[local_rank]
+    
+    def get_zmq_port(self, replica_rank, local_rank):
+        return self.replica_configs[replica_rank].zmq_port
 
 class MIIConfig(DeepSpeedConfigModel):
     deployment_name: str = ""

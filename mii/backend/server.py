@@ -110,20 +110,28 @@ class MIIServer:
     def _generate_ds_launch_str(self,
                                 replica_config: ReplicaConfig,
                                 hostfile: str,
-                                use_multiple_hosts) -> str:
+                                use_multiple_hosts,
+                                torch_dist_port: int=None,
+                                master_addr:str = "localhost") -> str:
         # use different hostfiles for replica instances
         # pass /dev/null when no replica is used
-        #worker_str = f"-H {hostfile} "
-        worker_str = ""
-        # pin deepspeed launch to specific gpu id(s)
-        included_gpus = f"{replica_config.hostname}:{','.join(map(str, replica_config.gpu_indices))}"
-        worker_str += f"-i {included_gpus} "
+        worker_str = f"-H {hostfile} "
+        # worker_str = ""
 
-        # adjust torch dist port depending on rank, otherwise multi-replica deployments will conflict
-        # assign different ports to replicas because they could be on the same host
-        worker_str += f"--master_port {replica_config.torch_dist_port}"
+        if replica_config:
+            assert torch_dist_port is None
+            # pin deepspeed launch to specific gpu id(s)
+            included_gpus = f"{replica_config.hostname}:{','.join(map(str, replica_config.gpu_indices))}"
+            worker_str += f"-i {included_gpus} "
 
-        ds_launch_str = f"deepspeed {worker_str} --master_addr localhost --no_ssh_check --no_local_rank --no_python"
+            # adjust torch dist port depending on rank, otherwise multi-replica deployments will conflict
+            # assign different ports to replicas because they could be on the same host
+            torch_dist_port = replica_config.torch_dist_port
+
+        assert torch_dist_port is not None
+        worker_str += f"--master_port {torch_dist_port}"
+
+        ds_launch_str = f"deepspeed {worker_str} --master_addr {master_addr} --no_ssh_check --no_local_rank --no_python"
         if use_multiple_hosts:
             ds_launch_str += f" --force_multi"
 
@@ -147,24 +155,40 @@ class MIIServer:
             set(repl_config.hostname
                 for repl_config in mii_config.model_config.replica_configs)) > 1
 
-        # Start replica instances
-        for repl_config in mii_config.model_config.replica_configs:
-            hostfile = tempfile.NamedTemporaryFile(delete=False)
-            hostfile.write(
-                f"{repl_config.hostname} slots={max(host_gpus[repl_config.hostname])+1}\n"
-                .encode())
-            ds_launch_str = self._generate_ds_launch_str(repl_config,
-                                                         hostfile.name,
-                                                         use_multiple_hosts)
+        if mii_config.model_config.expert_parallel:
+            ds_launch_str = self._generate_ds_launch_str(None,
+                                                         mii_config.hostfile,
+                                                         use_multiple_hosts,
+                                                         torch_dist_port=mii_config.model_config.torch_dist_port,
+                                                         master_addr=mii_config.model_config.replica_configs[0].hostname)
             processes.append(
                 self._launch_server_process(
                     mii_config.model_config,
                     "MII server",
                     ds_launch_str=ds_launch_str,
                     server_args=server_args + [
-                        f"--server-port {repl_config.tensor_parallel_ports[0]} --zmq-port {repl_config.zmq_port}"
+                        "--derive-ports"
                     ],
                 ))
+        else:
+            # Start replica instances
+            for repl_config in mii_config.model_config.replica_configs:
+                hostfile = tempfile.NamedTemporaryFile(delete=False)
+                hostfile.write(
+                    f"{repl_config.hostname} slots={max(host_gpus[repl_config.hostname])+1}\n"
+                    .encode())
+                ds_launch_str = self._generate_ds_launch_str(repl_config,
+                                                             hostfile.name,
+                                                             use_multiple_hosts)
+                processes.append(
+                    self._launch_server_process(
+                        mii_config.model_config,
+                        "MII server",
+                        ds_launch_str=ds_launch_str,
+                        server_args=server_args + [
+                            f"--server-port {repl_config.tensor_parallel_ports[0]} --zmq-port {repl_config.zmq_port}"
+                        ],
+                    ))
         # start load balancer here. We don't use deepspeed launcher for the
         # load balancer because it does not need a GPU. The deepspeed
         # launcher determines the number of processes to launch based on
