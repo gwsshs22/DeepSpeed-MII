@@ -152,6 +152,9 @@ class ModelConfig(DeepSpeedConfigModel):
     depolyed with data + tensor parallelism.
     """
 
+    simulated_gating: bool = False
+    simulated_gating_temperature: float = 1.0
+
     replica_configs: List[ReplicaConfig] = []
     """
     Configuration details for each replica. This will be automatically
@@ -220,6 +223,8 @@ class ModelConfig(DeepSpeedConfigModel):
         inference_engine_config.tensor_parallel.tp_size = tensor_parallel
         inference_engine_config.expert_parallel.enabled = ep_enabled
         inference_engine_config.expert_parallel.replica_num = replica_num
+        inference_engine_config.simulated_gating = values.get("simulated_gating")
+        inference_engine_config.simulated_gating_temperature = values.get("simulated_gating_temperature")
 
         return values
 
