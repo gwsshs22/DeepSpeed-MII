@@ -188,6 +188,8 @@ class ModelConfig(DeepSpeedConfigModel):
     """
     Log performance information about model inference with very little overhead.
     """
+
+    enable_pytorch_profiler: bool = False
     @property
     def provider(self) -> ModelProvider:
         return ModelProvider.HUGGING_FACE

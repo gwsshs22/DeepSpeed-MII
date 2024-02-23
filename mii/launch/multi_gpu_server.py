@@ -7,6 +7,8 @@ import base64
 import json
 import os
 
+import torch
+
 from mii.config import ModelConfig
 from mii.grpc_related.modelresponse_server import serve_inference, serve_load_balancing
 from mii.grpc_related.restful_gateway import init_gateway
@@ -106,7 +108,16 @@ def main() -> None:
         args.model_config.zmq_port_number = zmq_port
         inference_pipeline = async_pipeline(args.model_config)
         print(f"Starting server on port: {port}")
-        serve_inference(inference_pipeline, port)
+
+        if args.model_config.enable_pytorch_profiler:
+            with torch.profiler.profile(
+                activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+                record_shapes=True
+            ) as profiler:
+                serve_inference(inference_pipeline, port)
+            profiler.export_chrome_trace(f"trace_rank{local_rank}.json")
+        else:
+            serve_inference(inference_pipeline, port)
 
 
 if __name__ == "__main__":
