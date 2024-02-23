@@ -154,7 +154,7 @@ class ModelConfig(DeepSpeedConfigModel):
 
     simulated_gating: bool = False
     simulated_gating_temperature: float = 1.0
-
+    memory_reserve_size: int = 1_000_000_000
     replica_configs: List[ReplicaConfig] = []
     """
     Configuration details for each replica. This will be automatically
@@ -213,7 +213,7 @@ class ModelConfig(DeepSpeedConfigModel):
         return values
 
     @root_validator
-    def propagate_tp_ep_config(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+    def propagate_engine_config(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         tensor_parallel = values.get("tensor_parallel")
         replica_num = values.get("replica_num")
         ep_enabled = values.get("expert_parallel")
@@ -227,7 +227,7 @@ class ModelConfig(DeepSpeedConfigModel):
         inference_engine_config.expert_parallel.replica_num = replica_num
         inference_engine_config.simulated_gating = values.get("simulated_gating")
         inference_engine_config.simulated_gating_temperature = values.get("simulated_gating_temperature")
-
+        inference_engine_config.state_manager.memory_config.size = values.get("memory_reserve_size")
         return values
 
     @root_validator
