@@ -6,6 +6,9 @@ import argparse
 import base64
 import json
 import os
+from pathlib import Path
+from dataclasses import asdict
+import json
 
 import torch
 
@@ -14,6 +17,7 @@ from mii.grpc_related.modelresponse_server import serve_inference, serve_load_ba
 from mii.grpc_related.restful_gateway import init_gateway
 from mii.api import async_pipeline
 
+from deepspeed.inference.v2.tracer import get_tracer
 
 def b64_encoded_config(config_str: str) -> ModelConfig:
     # str -> bytes
@@ -118,6 +122,19 @@ def main() -> None:
             profiler.export_chrome_trace(f"trace_rank{local_rank}.json")
         else:
             serve_inference(inference_pipeline, port)
+        
+        if args.model_config.trace_enabled:
+            trace_dir = Path(args.model_config.trace_dir)
+            trace_dir.mkdir(parents=True, exist_ok=True)
+
+            trace_path = trace_dir / f"trace_{local_rank}.json"
+            tracer = get_tracer()
+            assert tracer is not None
+
+            with trace_path.open("w") as f:
+                for s in tracer.batch_summaries():
+                    f.write(json.dumps(asdict(s)))
+                    f.write("\n")
 
 
 if __name__ == "__main__":

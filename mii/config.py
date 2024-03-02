@@ -155,6 +155,10 @@ class ModelConfig(DeepSpeedConfigModel):
     simulated_gating: bool = False
     simulated_gating_temperature: float = 1.0
     memory_reserve_size: int = 1_000_000_000
+
+    trace_enabled: bool = False
+    trace_dir: str = None
+
     replica_configs: List[ReplicaConfig] = []
     """
     Configuration details for each replica. This will be automatically
@@ -228,6 +232,8 @@ class ModelConfig(DeepSpeedConfigModel):
         inference_engine_config.simulated_gating = values.get("simulated_gating")
         inference_engine_config.simulated_gating_temperature = values.get("simulated_gating_temperature")
         inference_engine_config.state_manager.memory_config.size = values.get("memory_reserve_size")
+        inference_engine_config.trace_enabled = values.get("trace_enabled")
+
         return values
 
     @root_validator
