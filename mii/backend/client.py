@@ -55,6 +55,11 @@ class MIIClient:
                                       task_methods.method_stream_out)(proto_request):
             yield task_methods.unpack_response_from_proto(response)
 
+    async def async_generate(self, prompt: str, **query_kwargs: Dict[str, Any]) -> Response:
+        response_list = await self._request_async_response([prompt], **query_kwargs)
+        assert len(response_list) == 1
+        return response_list[0]
+
     def generate(self,
                  prompts: Union[str,
                                 List[str]],
